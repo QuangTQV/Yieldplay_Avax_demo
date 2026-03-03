@@ -69,9 +69,9 @@ CREATE INDEX idx_daily_attempts_user_date ON daily_attempts(user_id, play_date);
 CREATE INDEX idx_daily_attempts_season ON daily_attempts(season_id);
 CREATE INDEX idx_season_participants_season ON season_participants(season_id);
 
--- Seed active season
-INSERT INTO seasons (name, start_date, end_date, status)
-VALUES ('Season 1', CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days', 'active');
+-- -- Seed active season
+-- INSERT INTO seasons (name, start_date, end_date, status)
+-- VALUES ('Season 1', CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days', 'active');
 
 -- Seed daily words (30 days)
 -- In production this would be a managed word pool

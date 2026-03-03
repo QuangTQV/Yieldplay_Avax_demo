@@ -95,14 +95,13 @@ class EndSeasonResponse(BaseModel):
 
 
 from datetime import datetime
-from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
 class YieldPlayCreatePoolResponse(BaseModel):
     success: bool = Field(..., description="Indicates whether pool creation succeeded")
-    pool_id: UUID = Field(..., description="Unique identifier of the created pool")
+    pool_id: str = Field(..., description="Unique identifier of the created pool")
     name: str = Field(..., description="Name of the pool")
     start_time: datetime = Field(..., description="Pool start timestamp (UTC)")
     end_time: datetime = Field(..., description="Pool end timestamp (UTC)")
