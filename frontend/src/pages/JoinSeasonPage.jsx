@@ -1,8 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import {
+  checkParticipation,
+  getActiveSeason,
+  joinSeasonConfirm,
+  joinSeasonPrepare,
+} from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { useMetaMask } from '../hooks/useMetaMask'
-import { getActiveSeason, joinSeason, checkParticipation } from '../api/client'
 
 const s = {
   page: { minHeight: '100vh', background: '#121213', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 },
@@ -15,6 +20,7 @@ const s = {
   stakeInput: { width: '100%', padding: '14px 16px', background: '#121213', border: '1px solid #3a3a3c', borderRadius: 8, color: '#fff', fontSize: 20, fontWeight: 700, outline: 'none', fontFamily: 'inherit', marginBottom: 12, boxSizing: 'border-box' },
   breakdown: { fontSize: 13, color: '#818384', marginBottom: 20, lineHeight: 2 },
   btn: { width: '100%', padding: 14, background: '#538d4e', color: '#fff', borderRadius: 10, fontWeight: 700, fontSize: 16, border: 'none', cursor: 'pointer' },
+  btnDisabled: { opacity: 0.5, cursor: 'not-allowed' },
   skipBtn: { width: '100%', padding: 12, background: 'transparent', color: '#818384', borderRadius: 10, fontWeight: 600, fontSize: 14, border: '1px solid #3a3a3c', cursor: 'pointer', marginTop: 10 },
   error: { background: '#3a1a1a', border: '1px solid #7a2a2a', color: '#ff6b6b', padding: '10px 16px', borderRadius: 8, fontSize: 13, marginBottom: 16 },
   success: { background: '#1a3a1a', border: '1px solid #2a7a2a', color: '#6dff6d', padding: '14px 16px', borderRadius: 8, fontSize: 14, marginBottom: 16 },
@@ -23,10 +29,16 @@ const s = {
   signingRow: { display: 'flex', justifyContent: 'space-between', fontSize: 13, padding: '7px 0', borderBottom: '1px solid #2a2a4a' },
   signBtn: { width: '100%', padding: 14, background: '#f6851b', color: '#fff', borderRadius: 10, fontWeight: 800, fontSize: 16, border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 },
   txBadge: { background: '#121213', border: '1px solid #3a3a3c', borderRadius: 6, padding: '8px 12px', fontSize: 11, fontFamily: 'monospace', color: '#818384', wordBreak: 'break-all', marginTop: 10 },
-  avaxLink: { color: '#e84142', fontSize: 12, textDecoration: 'underline', cursor: 'pointer' },
+  confirmingBox: { background: '#1a1a2a', border: '1px solid #3a3a6a', borderRadius: 10, padding: 20, marginBottom: 20, textAlign: 'center' },
+  spinner: { display: 'inline-block', width: 24, height: 24, border: '3px solid #3a3a6a', borderTop: '3px solid #f6851b', borderRadius: '50%', animation: 'spin 1s linear infinite', marginBottom: 12 },
 }
 
-const STEP = { STAKE: 'stake', SIGNING: 'signing', DONE: 'done' }
+const STEP = {
+  STAKE:       'stake',       // nhập amount
+  SIGNING:     'signing',     // hiển thị tx details, chờ MetaMask
+  CONFIRMING:  'confirming',  // tx đã gửi, chờ on-chain confirmation
+  DONE:        'done',        // confirmed + DB ghi xong
+}
 
 function MetaMaskIcon({ size = 20 }) {
   return (
@@ -41,26 +53,26 @@ function MetaMaskIcon({ size = 20 }) {
 
 export default function JoinSeasonPage() {
   const { user } = useAuth()
-  const navigate = useNavigate()
-  const { connected, address, isCorrectChain, signMessage, switchToAvalanche } = useMetaMask()
+  const navigate  = useNavigate()
+  const { connected, address, isCorrectChain, switchToAvalanche } = useMetaMask()
 
-  const [season, setSeason] = useState(null)
-  const [amount, setAmount] = useState('10')
-  const [error, setError] = useState('')
-  const [step, setStep] = useState(STEP.STAKE)
-  const [joinResult, setJoinResult] = useState(null)
-  const [txSig, setTxSig] = useState(null)
-  const [signing, setSigning] = useState(false)
-  const [loading, setLoading] = useState(false)
+  const [season,      setSeason]      = useState(null)
+  const [amount,      setAmount]      = useState('10')
+  const [error,       setError]       = useState('')
+  const [step,        setStep]        = useState(STEP.STAKE)
+  const [prepareData, setPrepareData] = useState(null)  // response từ /join/prepare
+  const [txHash,      setTxHash]      = useState('')
+  const [confirmData, setConfirmData] = useState(null)  // response từ /join/confirm
+  const [loading,     setLoading]     = useState(false)
 
+  // ── Init ─────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const init = async () => {
       try {
-        const s = await getActiveSeason()
-        setSeason(s)
-        // Đã join rồi → vào thẳng game
+        const activeSeason = await getActiveSeason()
+        setSeason(activeSeason)
         if (user?.id) {
-          const hasJoined = await checkParticipation(s.id, user.id)
+          const hasJoined = await checkParticipation(activeSeason.id, user.id)
           if (hasJoined) navigate('/play')
         }
       } catch {}
@@ -68,130 +80,196 @@ export default function JoinSeasonPage() {
     init()
   }, [user?.id])
 
-  const fee = parseFloat(amount) * 0.02 || 0
-  const principal = parseFloat(amount) - fee || 0
+  const amountFloat = parseFloat(amount) || 0
 
-  // Step 1: Backend ghi stake, mock gọi YieldPlay /transactions/enter
-  const handleJoin = async () => {
-    if (!season) return
+  // ── Step 1: Validate + build unsigned tx từ server ───────────────────────────
+  const handlePrepare = async () => {
     setError('')
-    if (!connected) { setError('MetaMask chưa kết nối'); return }
-    if (!isCorrectChain) { setError('Cần chuyển sang Avalanche Fuji Testnet'); switchToAvalanche(); return }
-    const amt = parseFloat(amount)
-    if (isNaN(amt) || amt < 1) { setError('Minimum stake is 1 USDC'); return }
+    if (!connected)       { setError('MetaMask chưa kết nối'); return }
+    if (!isCorrectChain)  { setError('Cần chuyển sang đúng network'); switchToAvalanche(); return }
+    if (amountFloat < 1)  { setError('Minimum stake is 1 USDC'); return }
+    if (!season)          return
+
     setLoading(true)
     try {
-      const result = await joinSeason(user.id, season.id, amt)
-      setJoinResult(result)
+      // Gọi /seasons/join/prepare → server validate + build unsigned tx
+      // Nếu allowance thấp, server trả 400 "Call /tx/build/approve first"
+      const data = await joinSeasonPrepare(user.id, season.id, amountFloat)
+      setPrepareData(data)
       setStep(STEP.SIGNING)
     } catch (err) {
-      const msg = err.response?.data?.detail || 'Failed to join season'
-      if (msg.includes('Already')) navigate('/play')
-      else setError(msg)
+      const detail = err.response?.data?.detail || err.message || 'Failed to prepare transaction'
+      if (detail.includes('Already joined')) navigate('/play')
+      // Nếu cần approve trước → hướng dẫn user
+      else if (detail.includes('approve')) setError(`Token chưa được approve. ${detail}`)
+      else setError(detail)
     } finally {
       setLoading(false)
     }
   }
 
-  // Step 2: MetaMask ký để xác nhận — demo YieldPlay signing flow
-  const handleSign = async () => {
-    setSigning(true)
+  // ── Step 2: Gửi tx thật qua MetaMask (sendTransaction) ───────────────────────
+  const handleSendTransaction = async () => {
     setError('')
+    setLoading(true)
     try {
-      /**
-       * Production với YieldPlay contract AVAX:
-       *   const txHash = await sendTransaction({
-       *     to: YIELDPLAY_CONTRACT_ADDRESS,
-       *     data: joinResult.encoded_tx_data,   // ABI-encoded calldata
-       *     value: ethers.parseUnits(amount, 6).toString(16),
-       *   })
-       *
-       * Demo: dùng personal_sign để MetaMask popup hiện ra thật.
-       * User thấy đúng details của giao dịch trước khi ký.
-       */
-      const message = [
-        '=== YieldPlay Season Entry ===',
-        '',
-        `Network  : Avalanche Fuji Testnet (Chain 43113)`,
-        `Season   : ${season.name}`,
-        `Amount   : ${joinResult.amount_staked} USDC`,
-        `Fee (2%) : ${joinResult.participation_fee} USDC → Reward Pool`,
-        `Principal: ${joinResult.principal} USDC → Yield (~4.5% APY)`,
-        '',
-        `Wallet   : ${address}`,
-        `Time     : ${new Date().toISOString()}`,
-        '',
-        'By signing you confirm this stake on Avalanche.',
-      ].join('\n')
+      const unsignedTx = prepareData.unsigned_tx
 
-      const sig = await signMessage(message)
-      setTxSig(sig)
-      setStep(STEP.DONE)
+      /**
+       * Gửi tx thật qua MetaMask eth_sendTransaction.
+       * MetaMask sẽ popup yêu cầu user confirm gas + sign.
+       *
+       * unsignedTx shape (từ /tx/build/deposit):
+       *   { to, data, gas, nonce, chainId, value, gasPrice? }
+       *
+       * Dùng window.ethereum trực tiếp để pass đúng hex format.
+       */
+      const txParams = {
+        from:  address,
+        to:    unsignedTx.to,
+        data:  unsignedTx.data,
+        gas:   '0x' + unsignedTx.gas.toString(16),
+        value: '0x' + (unsignedTx.value || 0).toString(16),
+        // gasPrice hoặc EIP-1559 fields
+        ...(unsignedTx.maxFeePerGas
+          ? {
+              maxFeePerGas:         '0x' + unsignedTx.maxFeePerGas.toString(16),
+              maxPriorityFeePerGas: '0x' + unsignedTx.maxPriorityFeePerGas.toString(16),
+            }
+          : {
+              gasPrice: '0x' + unsignedTx.gasPrice.toString(16),
+            }),
+      }
+
+      // eth_sendTransaction → MetaMask popup → user confirm → trả tx hash
+      const hash = await window.ethereum.request({
+        method: 'eth_sendTransaction',
+        params: [txParams],
+      })
+
+      setTxHash(hash)
+      setStep(STEP.CONFIRMING)
+
+      // Sau khi có hash → gọi confirm để server verify on-chain + ghi DB
+      await handleConfirm(hash)
     } catch (err) {
       if (err.code === 4001 || err.message?.includes('rejected')) {
-        setError('Rejected. Please approve in MetaMask to confirm your stake.')
+        setError('Transaction rejected. Please approve in MetaMask.')
       } else {
-        setError(err.message || 'Signing failed')
+        setError(err.message || 'Transaction failed')
       }
     } finally {
-      setSigning(false)
+      setLoading(false)
     }
   }
 
-  // ── Done ──
+  // ── Step 3: Confirm với server sau khi broadcast ─────────────────────────────
+  const handleConfirm = async (hash) => {
+    try {
+      // Server verify tx status on-chain → ghi SeasonParticipant vào DB
+      const data = await joinSeasonConfirm(user.id, season.id, amountFloat, hash)
+      setConfirmData(data)
+      setStep(STEP.DONE)
+    } catch (err) {
+      // Tx đã broadcast nhưng confirm thất bại (chưa mined, node chậm...)
+      // Không báo lỗi ngay — giữ ở CONFIRMING, user có thể retry
+      const detail = err.response?.data?.detail || err.message || ''
+      if (detail.includes('not yet confirmed')) {
+        setError('Transaction chưa được confirm. Vui lòng đợi thêm và thử lại.')
+      } else {
+        setError(`Confirm failed: ${detail}`)
+        // Vẫn ở CONFIRMING để user có thể retry confirm thủ công
+      }
+    }
+  }
+
+  // ── DONE ─────────────────────────────────────────────────────────────────────
   if (step === STEP.DONE) {
-    const explorerUrl = `https://testnet.snowtrace.io/address/${address}`
     return (
       <div style={s.page}>
         <div style={s.card}>
           <div style={{ fontSize: 48, textAlign: 'center', marginBottom: 12 }}>🎉</div>
-          <h2 style={{ ...s.title, color: '#538d4e', marginBottom: 16, textAlign: 'center' }}>Stake Confirmed!</h2>
+          <h2 style={{ ...s.title, color: '#538d4e', marginBottom: 16, textAlign: 'center' }}>
+            Stake Confirmed!
+          </h2>
           <div style={s.success}>
-            <div>Staked: <strong>{joinResult.amount_staked} USDC</strong></div>
-            <div>Fee → Reward Pool: <strong>{joinResult.participation_fee} USDC</strong></div>
-            <div>Principal earning yield: <strong>{joinResult.principal} USDC</strong></div>
+            <div>Staked: <strong>{confirmData?.amount_deposited ?? amountFloat} USDC</strong></div>
+            <div>Transaction confirmed on-chain ✓</div>
           </div>
-          {txSig && (
+          {txHash && (
             <>
-              <div style={{ fontSize: 12, color: '#818384', marginBottom: 4 }}>Signature (MetaMask):</div>
-              <div style={s.txBadge}>{txSig.slice(0, 66)}...</div>
+              <div style={{ fontSize: 12, color: '#818384', marginBottom: 4 }}>Transaction Hash:</div>
+              <div style={s.txBadge}>{txHash}</div>
               <div style={{ marginTop: 8, textAlign: 'right' }}>
-                <span style={s.avaxLink} onClick={() => window.open(explorerUrl, '_blank')}>
-                  View on Snowtrace ↗
+                <span
+                  style={{ color: '#e84142', fontSize: 12, textDecoration: 'underline', cursor: 'pointer' }}
+                  onClick={() => window.open(`https://sepolia.etherscan.io/tx/${txHash}`, '_blank')}
+                >
+                  View on Etherscan ↗
                 </span>
               </div>
             </>
           )}
           <p style={{ color: '#818384', fontSize: 13, margin: '20px 0', lineHeight: 1.7 }}>
-            Principal đang sinh yield ~4.5% APY trong 30 ngày.
+            Principal đang sinh yield trong vault.
             Yield + fees sẽ phân phối cho top players khi season kết thúc.
           </p>
-          <button style={s.btn} onClick={() => navigate('/play')}>Start Playing →</button>
+          <button style={s.btn} onClick={() => navigate('/play')}>
+            Start Playing →
+          </button>
         </div>
       </div>
     )
   }
 
-  // ── Signing step ──
+  // ── CONFIRMING (tx đã broadcast, chờ on-chain) ────────────────────────────────
+  if (step === STEP.CONFIRMING) {
+    return (
+      <div style={s.page}>
+        <div style={s.card}>
+          <h1 style={s.title}>⏳ Confirming...</h1>
+          <p style={s.sub}>Transaction đã được gửi, đang chờ on-chain confirmation</p>
+          {error && (
+            <>
+              <div style={s.error}>{error}</div>
+              <button style={s.btn} onClick={() => handleConfirm(txHash)} disabled={loading}>
+                {loading ? 'Retrying...' : 'Retry Confirm'}
+              </button>
+            </>
+          )}
+          {!error && (
+            <div style={s.confirmingBox}>
+              <div style={s.spinner} />
+              <div style={{ color: '#818384', fontSize: 13 }}>Waiting for block confirmation...</div>
+              {txHash && <div style={s.txBadge}>{txHash}</div>}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ── SIGNING (hiển thị tx details, chờ MetaMask) ───────────────────────────────
   if (step === STEP.SIGNING) {
+    const tx = prepareData?.unsigned_tx
     return (
       <div style={s.page}>
         <div style={s.card}>
           <h1 style={s.title}>🦊 Confirm in MetaMask</h1>
-          <p style={s.sub}>Review transaction details, then sign in MetaMask</p>
+          <p style={s.sub}>Review transaction details, then confirm in MetaMask</p>
           {error && <div style={s.error}>{error}</div>}
+
           <div style={s.signingCard}>
             <div style={s.signingTitle}>
               <MetaMaskIcon size={18} /> Transaction Details
             </div>
             {[
-              ['Network', 'Avalanche Fuji Testnet'],
-              ['Action', 'Stake into Season'],
-              ['Season', season?.name],
-              ['Amount', `${joinResult?.amount_staked} USDC`],
-              ['Fee (2%)', `${joinResult?.participation_fee} USDC → Reward Pool`],
-              ['Principal', `${joinResult?.principal} USDC → Yield`],
-              ['Wallet', address ? address.slice(0, 20) + '...' : '-'],
+              ['Action',    'Deposit into YieldPlay round'],
+              ['Season',    season?.name],
+              ['Amount',    `${amountFloat} USDC`],
+              ['Contract',  tx?.to ? tx.to.slice(0, 20) + '...' : '-'],
+              ['Gas Limit', tx?.gas?.toLocaleString() ?? '-'],
+              ['Wallet',    address ? address.slice(0, 20) + '...' : '-'],
             ].map(([k, v]) => (
               <div key={k} style={s.signingRow}>
                 <span style={{ color: '#818384' }}>{k}</span>
@@ -199,45 +277,80 @@ export default function JoinSeasonPage() {
               </div>
             ))}
           </div>
-          <button style={s.signBtn} onClick={handleSign} disabled={signing || !connected}>
+
+          <button
+            style={{ ...s.signBtn, ...(loading ? s.btnDisabled : {}) }}
+            onClick={handleSendTransaction}
+            disabled={loading || !connected}
+          >
             <MetaMaskIcon size={20} />
-            {signing ? 'Waiting for MetaMask...' : 'Sign with MetaMask'}
+            {loading ? 'Waiting for MetaMask...' : 'Send Transaction'}
           </button>
-          {!connected && <div style={{ ...s.error, marginTop: 10 }}>MetaMask chưa kết nối</div>}
+
+          {!connected && (
+            <div style={{ ...s.error, marginTop: 10 }}>MetaMask chưa kết nối</div>
+          )}
+
+          <button
+            style={{ ...s.skipBtn }}
+            onClick={() => { setStep(STEP.STAKE); setPrepareData(null); setError('') }}
+          >
+            ← Back
+          </button>
         </div>
       </div>
     )
   }
 
-  // ── Stake form ──
+  // ── STAKE form ────────────────────────────────────────────────────────────────
   return (
     <div style={s.page}>
       <div style={s.card}>
         <h1 style={s.title}>💰 Join Season</h1>
-        <p style={s.sub}>Stake USDC to participate and earn yield-backed rewards on Avalanche</p>
+        <p style={s.sub}>Stake USDC to participate and earn yield-backed rewards</p>
+
         {season && (
           <div style={s.infoBox}>
             {[
-              ['Season', season.name],
-              ['Duration', `${season.start_date} → ${season.end_date}`],
-              ['Reward Pool', `$${season.total_reward_pool.toFixed(2)} USDC`],
+              ['Season',       season.name],
+              ['Duration',     `${season.start_date} → ${season.end_date}`],
+              ['Reward Pool',  `$${(season.total_reward_pool || 0).toFixed(2)} USDC`],
               ['Distribution', 'Top 3: 50% / 30% / 20%'],
             ].map(([k, v]) => (
-              <div key={k} style={s.row}><span style={s.rowLabel}>{k}</span><span style={s.rowVal}>{v}</span></div>
+              <div key={k} style={s.row}>
+                <span style={s.rowLabel}>{k}</span>
+                <span style={s.rowVal}>{v}</span>
+              </div>
             ))}
           </div>
         )}
+
         {error && <div style={s.error}>{error}</div>}
-        <label style={{ display: 'block', fontSize: 13, color: '#818384', marginBottom: 8, fontWeight: 600 }}>Stake Amount (USDC)</label>
-        <input style={s.stakeInput} type="number" min="1" step="0.5" value={amount} onChange={e => setAmount(e.target.value)} placeholder="10" />
+
+        <label style={{ display: 'block', fontSize: 13, color: '#818384', marginBottom: 8, fontWeight: 600 }}>
+          Stake Amount (USDC)
+        </label>
+        <input
+          style={s.stakeInput}
+          type="number" min="1" step="0.5"
+          value={amount}
+          onChange={e => setAmount(e.target.value)}
+          placeholder="10"
+        />
         <div style={s.breakdown}>
-          <div>📊 Fee (2%): <strong style={{ color: '#b59f3b' }}>{fee.toFixed(4)} USDC</strong> → Reward Pool</div>
-          <div>🔒 Principal: <strong style={{ color: '#538d4e' }}>{principal.toFixed(4)} USDC</strong> → Earning ~4.5% APY</div>
+          <div>🔒 Principal: <strong style={{ color: '#538d4e' }}>{amountFloat.toFixed(4)} USDC</strong> → Earning yield in vault</div>
         </div>
-        <button style={s.btn} onClick={handleJoin} disabled={loading}>
-          {loading ? 'Processing...' : `Stake ${amount} USDC & Join →`}
+
+        <button
+          style={{ ...s.btn, ...(loading ? s.btnDisabled : {}) }}
+          onClick={handlePrepare}
+          disabled={loading}
+        >
+          {loading ? 'Preparing...' : `Stake ${amount} USDC & Join →`}
         </button>
-        <button style={s.skipBtn} onClick={() => navigate('/play')}>Skip (view only)</button>
+        <button style={s.skipBtn} onClick={() => navigate('/play')}>
+          Skip (view only)
+        </button>
       </div>
     </div>
   )

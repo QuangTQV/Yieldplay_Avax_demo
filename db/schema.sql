@@ -33,6 +33,7 @@ CREATE TABLE season_participants (
     user_id UUID REFERENCES users(id),
     season_id UUID REFERENCES seasons(id),
     amount_staked DECIMAL(18, 6) NOT NULL,       -- principal (100% trả lại user)
+    deposit_tx_hash VARCHAR(100) NOT NULL,      -- tx hash của deposit vào vault
     joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(user_id, season_id)
 );

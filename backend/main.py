@@ -1,17 +1,16 @@
 from contextlib import asynccontextmanager
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
+import models  # noqa: F401
 from config import settings
 from database import AsyncSessionLocal, Base, engine
 from models import Season
 from routers import game, leaderboard, seasons, users
 from services.yieldplay_mock import create_game, create_round
-
-import models  # noqa: F401
 
 
 async def _seed_if_empty() -> None:
@@ -39,11 +38,12 @@ async def _seed_if_empty() -> None:
 
         # Tạo round cho Season 1
         start_date = date.today()
-        end_date   = start_date + timedelta(days=30)
+        end_date = start_date + timedelta(days=30)
 
         def to_ts(d: date) -> int:
-            return int(datetime.combine(d, datetime.min.time())
-                       .replace(tzinfo=timezone.utc).timestamp())
+            return int(
+                datetime.combine(d, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp()
+            )
 
         round_response = await create_round(
             game_id=game_id,
@@ -57,7 +57,7 @@ async def _seed_if_empty() -> None:
             start_date=start_date,
             end_date=end_date,
             status="active",
-            dev_fee_bps=1000,
+            dev_fee_bps=5000,
             yieldplay_game_id=game_id,
             yieldplay_round_id=round_response.round_id,
         )

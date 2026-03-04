@@ -1,25 +1,24 @@
 """
 YieldPlay Real Client — gọi trực tiếp YieldPlay API server.
 
-Interface GIỐNG HỆT yieldplay_mock.py — seasons.py không cần thay đổi.
+Architecture non-custodial
+──────────────────────────
+Server giữ private key của GAME OWNER → ký các tx quản lý game.
+User giữ private key của chính họ    → frontend tự ký deposit/claim.
 
-Khi switch từ mock sang real:
-    .env: YIELDPLAY_USE_MOCK=false
-    Đảm bảo YIELDPLAY_BASE_URL, YIELDPLAY_API_KEY, YIELDPLAY_GAME_ID đã set.
-
-Endpoints ánh xạ:
-    create_game()          → POST /games
-    create_round()         → POST /games/{game_id}/rounds
-    approve_token()        → POST /users/approve
-    deposit()              → POST /users/deposit
-    claim()                → POST /users/claim
-    deposit_to_vault()     → POST /rounds/vault/deposit
-    withdraw_from_vault()  → POST /rounds/vault/withdraw
-    settlement()           → POST /rounds/settlement
-    choose_winner()        → POST /rounds/winner
-    finalize_round()       → POST /rounds/finalize
-    get_fee_preview()      → GET  /rounds/{game_id}/{round_id}/fee-preview
-    calculate_prize_pool() → local arithmetic (giống mock)
+                    Backend (file này)          Frontend
+                    ──────────────────          ────────
+create_game()       POST /games                 –
+create_round()      POST /games/{id}/rounds     –
+deposit_to_vault()  POST /rounds/vault/deposit  –
+withdraw_from_vault POST /rounds/vault/withdraw –
+settlement()        POST /rounds/settlement     –
+choose_winner()     POST /rounds/winner         –
+finalize_round()    POST /rounds/finalize       –
+                                                POST /tx/build/approve
+approve_token()     [REMOVED — frontend only]   POST /tx/build/deposit
+deposit()           [REMOVED — frontend only]   POST /tx/build/claim
+claim()             [REMOVED — frontend only]   POST /tx/broadcast
 """
 
 from __future__ import annotations
@@ -34,29 +33,36 @@ from services.types import (
     CreateRoundResponse,
     FeeBreakdown,
     TransactionResult,
+    UnsignedTxResponse,
 )
 
-PERFORMANCE_FEE_BPS: int = 2000
+PERFORMANCE_FEE_BPS: int = 2_000
 MOCK_APY: float = 0.045
 SEASON_DAYS: int = 30
 DECIMALS: int = 6
 TOP3_WEIGHTS: list[float] = [0.50, 0.30, 0.20]
 
 
-# ── HTTP client ────────────────────────────────────────────────────────────────
+# ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 
 def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {settings.YIELDPLAY_API_KEY}",
+    headers = {
         "Content-Type": "application/json",
     }
+
+    api_key = settings.YIELDPLAY_API_KEY
+    if api_key:
+        # Không dùng Bearer, gửi raw key
+        headers["Authorization"] = api_key
+
+    return headers
 
 
 async def _post(path: str, body: dict) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            f"{settings.YIELDPLAY_BASE_URL}{path}",
+            f"{settings.YIELDPLAY_BASE_URL}{settings.YIELDPLAY_API_PREFIX}{path}",
             json=body,
             headers=_headers(),
         )
@@ -67,7 +73,7 @@ async def _post(path: str, body: dict) -> dict:
 async def _get(path: str, params: dict | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            f"{settings.YIELDPLAY_BASE_URL}{path}",
+            f"{settings.YIELDPLAY_BASE_URL}{settings.YIELDPLAY_API_PREFIX}{path}",
             params=params,
             headers=_headers(),
         )
@@ -87,9 +93,11 @@ def _from_wei(amount_wei: int) -> float:
 
 
 def _tx(data: dict) -> TransactionResult:
+    """Parse TransactionResult from any API response shape."""
+    tx = data.get("transaction") or data
     return TransactionResult(
-        tx_hash=data.get("tx_hash") or data.get("transaction", {}).get("tx_hash"),
-        success=data.get("success", True),
+        tx_hash=tx.get("tx_hash", ""),
+        success=tx.get("status", 1) == 1,
         message=data.get("message", ""),
     )
 
@@ -99,21 +107,19 @@ def _tx(data: dict) -> TransactionResult:
 
 def calculate_prize_pool(
     total_deposited: float,
-    dev_fee_bps: int = 1000,
+    dev_fee_bps: int = 1_000,
     deposit_fee_bps: int = 0,
 ) -> FeeBreakdown:
     """
     Arithmetic thuần — không cần gọi API.
-    Giống mock, dùng để estimate prize pool realtime.
-
-    prize_pool = yield_to_pool + deposit_fee
+    Dùng để estimate prize pool realtime trên UI.
     """
     yield_amount = total_deposited * MOCK_APY * (SEASON_DAYS / 365)
-    perf_fee = yield_amount * (PERFORMANCE_FEE_BPS / 10000)
+    perf_fee = yield_amount * (PERFORMANCE_FEE_BPS / 10_000)
     net_yield = yield_amount - perf_fee
-    dev_fee = net_yield * (dev_fee_bps / 10000)
+    dev_fee = net_yield * (dev_fee_bps / 10_000)
     yield_to_pool = net_yield - dev_fee
-    deposit_fee = total_deposited * (deposit_fee_bps / 10000)
+    deposit_fee = total_deposited * (deposit_fee_bps / 10_000)
     prize_pool = yield_to_pool + deposit_fee
 
     return FeeBreakdown(
@@ -128,14 +134,17 @@ def calculate_prize_pool(
     )
 
 
-# ── 1. POST /games ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# GAME OWNER OPERATIONS — server ký bằng YIELDPLAY_PRIVATE_KEY
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 async def create_game(
     game_name: str,
-    dev_fee_bps: int = 1000,
-    treasury: str = "0x0000000000000000000000000000000000000000",
+    dev_fee_bps: int = 1_000,
+    treasury: str = settings.GAME_TREASURY_ADDRESS,
 ) -> CreateGameResponse:
+    """Tạo game mới. Server ký bằng game owner key."""
     data = await _post(
         "/games",
         {
@@ -146,20 +155,19 @@ async def create_game(
     )
     return CreateGameResponse(
         game_id=data["game_id"],
-        transaction=_tx(data.get("transaction", {})),
+        transaction=_tx(data),
     )
-
-
-# ── 2. POST /games/{game_id}/rounds ───────────────────────────────────────────
 
 
 async def create_round(
     game_id: str,
     start_ts: int,
     end_ts: int,
-    lock_time: int = 43200,
+    lock_time: int = 43_200,  # 12 hours
     deposit_fee_bps: int = 0,
+    payment_token: str = settings.YIELDPLAY_TOKEN_ADDRESS,
 ) -> CreateRoundResponse:
+    """Tạo round mới. Server ký bằng game owner key."""
     data = await _post(
         f"/games/{game_id}/rounds",
         {
@@ -168,72 +176,17 @@ async def create_round(
             "end_ts": end_ts,
             "lock_time": lock_time,
             "deposit_fee_bps": deposit_fee_bps,
+            "payment_token": payment_token,
         },
     )
     return CreateRoundResponse(
         round_id=data["round_id"],
-        transaction=_tx(data.get("transaction", {})),
+        transaction=_tx(data),
     )
-
-
-# ── 3. POST /users/approve ────────────────────────────────────────────────────
-
-
-async def approve_token(
-    user_wallet: str,
-    token_address: str,
-    amount_wei: int | None = None,
-) -> TransactionResult:
-    body: dict = {"token_address": token_address}
-    if amount_wei is not None:
-        body["amount_wei"] = str(amount_wei)
-    return _tx(await _post("/users/approve", body))
-
-
-# ── 4. POST /users/deposit ────────────────────────────────────────────────────
-
-
-async def deposit(
-    user_wallet: str,
-    game_id: str,
-    round_id: int,
-    amount_wei: int,
-) -> TransactionResult:
-    return _tx(
-        await _post(
-            "/users/deposit",
-            {
-                "game_id": game_id,
-                "round_id": round_id,
-                "amount_wei": str(amount_wei),
-            },
-        )
-    )
-
-
-# ── 5. POST /users/claim ──────────────────────────────────────────────────────
-
-
-async def claim(
-    user_wallet: str,
-    game_id: str,
-    round_id: int,
-) -> TransactionResult:
-    return _tx(
-        await _post(
-            "/users/claim",
-            {
-                "game_id": game_id,
-                "round_id": round_id,
-            },
-        )
-    )
-
-
-# ── 6. POST /rounds/vault/deposit ─────────────────────────────────────────────
 
 
 async def deposit_to_vault(game_id: str, round_id: int) -> TransactionResult:
+    """Deploy funds vào vault. Server ký bằng game owner key."""
     return _tx(
         await _post(
             "/rounds/vault/deposit",
@@ -245,10 +198,8 @@ async def deposit_to_vault(game_id: str, round_id: int) -> TransactionResult:
     )
 
 
-# ── 7. POST /rounds/vault/withdraw ────────────────────────────────────────────
-
-
 async def withdraw_from_vault(game_id: str, round_id: int) -> TransactionResult:
+    """Rút funds từ vault. Server ký bằng game owner key."""
     return _tx(
         await _post(
             "/rounds/vault/withdraw",
@@ -260,10 +211,8 @@ async def withdraw_from_vault(game_id: str, round_id: int) -> TransactionResult:
     )
 
 
-# ── 8. POST /rounds/settlement ────────────────────────────────────────────────
-
-
 async def settlement(game_id: str, round_id: int) -> TransactionResult:
+    """Phân phối phí. Server ký bằng game owner key."""
     return _tx(
         await _post(
             "/rounds/settlement",
@@ -275,15 +224,13 @@ async def settlement(game_id: str, round_id: int) -> TransactionResult:
     )
 
 
-# ── 9. POST /rounds/winner ────────────────────────────────────────────────────
-
-
 async def choose_winner(
     game_id: str,
     round_id: int,
     winner_address: str,
     amount_wei: int,
 ) -> TransactionResult:
+    """Chọn winner. Server ký bằng game owner key."""
     return _tx(
         await _post(
             "/rounds/winner",
@@ -297,10 +244,8 @@ async def choose_winner(
     )
 
 
-# ── 10. POST /rounds/finalize ─────────────────────────────────────────────────
-
-
 async def finalize_round(game_id: str, round_id: int) -> TransactionResult:
+    """Finalize round, mở cửa sổ claim. Server ký bằng game owner key."""
     return _tx(
         await _post(
             "/rounds/finalize",
@@ -312,17 +257,104 @@ async def finalize_round(game_id: str, round_id: int) -> TransactionResult:
     )
 
 
-# ── 11. GET /rounds/{game_id}/{round_id}/fee-preview ──────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# USER OPERATIONS — non-custodial, frontend ký
+#
+# Các hàm dưới đây trả về UnsignedTxResponse để frontend ký.
+# Gọi từ API endpoint của game server rồi trả về cho frontend.
+#
+# Flow:
+#   1. Frontend gọi game server API endpoint
+#   2. Game server gọi build_*() bên dưới → nhận unsigned tx
+#   3. Game server trả unsigned tx cho frontend
+#   4. Frontend ký bằng MetaMask / WalletConnect
+#   5. Frontend gọi broadcast_tx() để push lên chain
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def build_approve_tx(
+    user_wallet: str,
+    token_address: str,
+    amount_wei: int | None = None,
+) -> UnsignedTxResponse:
+    """
+    Build unsigned approve tx cho user ký.
+    amount_wei=None → approve MaxUint256 (unlimited).
+    """
+    body: dict = {
+        "from_address": user_wallet,
+        "token_address": token_address,
+    }
+    if amount_wei is not None:
+        body["amount_wei"] = str(amount_wei)
+    return UnsignedTxResponse(**(await _post("/tx/build/approve", body)))
+
+
+async def build_deposit_tx(
+    user_wallet: str,
+    game_id: str,
+    round_id: int,
+    amount_wei: int,
+) -> UnsignedTxResponse:
+    """
+    Build unsigned deposit tx cho user ký.
+    Validates round status + balance trước khi build — raise HTTPError nếu invalid.
+    """
+    return UnsignedTxResponse(
+        **(
+            await _post(
+                "/tx/build/deposit",
+                {
+                    "from_address": user_wallet,
+                    "game_id": game_id,
+                    "round_id": round_id,
+                    "amount_wei": str(amount_wei),
+                },
+            )
+        )
+    )
+
+
+async def build_claim_tx(
+    user_wallet: str,
+    game_id: str,
+    round_id: int,
+) -> UnsignedTxResponse:
+    """Build unsigned claim tx cho user ký."""
+    return UnsignedTxResponse(
+        **(
+            await _post(
+                "/tx/build/claim",
+                {
+                    "from_address": user_wallet,
+                    "game_id": game_id,
+                    "round_id": round_id,
+                },
+            )
+        )
+    )
+
+
+async def broadcast_tx(signed_tx: str) -> str:
+    """
+    Push signed tx lên chain. Trả về tx_hash.
+    signed_tx: hex string "0x..." từ wallet sau khi ký.
+    """
+    data = await _post("/tx/broadcast", {"signed_tx": signed_tx})
+    return data["tx_hash"]
+
+
+# ── Fee preview ────────────────────────────────────────────────────────────────
 
 
 async def get_fee_preview(
     game_id: str,
     round_id: int,
     total_deposited: float,
-    dev_fee_bps: int = 1000,
+    dev_fee_bps: int = 1_000,
 ) -> FeeBreakdown:
     """
-    Gọi API để lấy fee preview chính xác từ on-chain state.
+    Lấy fee preview từ on-chain state.
     Fallback về local calculation nếu API fail.
     """
     try:
@@ -331,14 +363,26 @@ async def get_fee_preview(
             params={"yield_wei": _to_wei(total_deposited * MOCK_APY * SEASON_DAYS / 365)},
         )
         return FeeBreakdown(
-            total_yield_wei=int(data.get("total_yield_wei", 0)),
-            performance_fee_wei=int(data.get("performance_fee_wei", 0)),
-            dev_fee_wei=int(data.get("dev_fee_wei", 0)),
-            deposit_fee_wei=int(data.get("deposit_fee_wei", 0)),
-            prize_pool_wei=int(data.get("prize_pool_wei", 0)),
-            total_yield_formatted=float(data.get("total_yield_formatted", 0)),
-            deposit_fee_formatted=float(data.get("deposit_fee_formatted", 0)),
-            prize_pool_formatted=float(data.get("prize_pool_formatted", 0)),
+            total_yield_wei=int(data.get("vault_yield", 0)),
+            performance_fee_wei=int(data.get("performance_fee", 0)),
+            dev_fee_wei=int(data.get("dev_fee", 0)),
+            deposit_fee_wei=int(data.get("deposit_fee_collected", 0)),
+            prize_pool_wei=int(data.get("total_prize_pool", 0)),
+            total_yield_formatted=_from_wei(int(data.get("vault_yield", 0))),
+            deposit_fee_formatted=_from_wei(int(data.get("deposit_fee_collected", 0))),
+            prize_pool_formatted=_from_wei(int(data.get("total_prize_pool", 0))),
         )
     except Exception:
         return calculate_prize_pool(total_deposited, dev_fee_bps)
+
+
+# ── REMOVED — đã chuyển sang non-custodial ────────────────────────────────────
+#
+# approve_token(user_wallet, token_address, amount_wei)
+#   → Thay bằng: build_approve_tx() + frontend ký + broadcast_tx()
+#
+# deposit(user_wallet, game_id, round_id, amount_wei)
+#   → Thay bằng: build_deposit_tx() + frontend ký + broadcast_tx()
+#
+# claim(user_wallet, game_id, round_id)
+#   → Thay bằng: build_claim_tx() + frontend ký + broadcast_tx()

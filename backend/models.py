@@ -64,9 +64,10 @@ class SeasonParticipant(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     season_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("seasons.id"))
     amount_staked: Mapped[float] = mapped_column(Numeric(18, 6))
-    participation_fee: Mapped[float] = mapped_column(Numeric(18, 6))
-    principal: Mapped[float] = mapped_column(Numeric(18, 6))
+    # participation_fee: Mapped[float] = mapped_column(Numeric(18, 6))
+    # principal: Mapped[float] = mapped_column(Numeric(18, 6))
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    deposit_tx_hash: Mapped[str] = mapped_column(String(100), nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="participations")
     season: Mapped["Season"] = relationship(back_populates="participants")
