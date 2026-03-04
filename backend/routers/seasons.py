@@ -6,13 +6,32 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from database import get_db
-from models import DailyAttempt, Season, SeasonParticipant, User, YieldPlayLog
+from models import DailyAttempt, Season, SeasonParticipant, User
 from schemas import JoinSeasonRequest, JoinSeasonResponse, SeasonCreate, SeasonOut
-from services.types import EndSeasonResponse, SeasonResult
-from services.yieldplay_mock import calculate_stake_split, create_pool, join_season, submit_results
+from services.types import EndSeasonResponse, WinnerEntry
+from services.yieldplay_mock import (
+    TOP3_WEIGHTS,
+    _to_wei,
+    calculate_prize_pool,
+    choose_winner,
+    create_round,
+    deposit,
+    deposit_to_vault,
+    finalize_round,
+    settlement,
+    withdraw_from_vault,
+)
 
 router = APIRouter(prefix="/seasons", tags=["seasons"])
+
+
+def _to_ts(d: date) -> int:
+    return int(datetime.combine(d, datetime.min.time()).replace(tzinfo=timezone.utc).timestamp())
+
+
+# ── Admin: Tạo season → POST /games/{game_id}/rounds ──────────────────────────
 
 
 @router.post("", response_model=SeasonOut, status_code=201)
@@ -22,44 +41,40 @@ async def create_season(
 ) -> SeasonOut:
     """
     Admin tạo season mới.
-    Tự động gọi YieldPlay POST /pools để tạo pool on-chain.
+    Tự động gọi YieldPlay POST /games/{game_id}/rounds để tạo round on-chain.
+    game_id đọc từ settings (tạo 1 lần khi deploy game).
     """
     if body.end_date <= body.start_date:
         raise HTTPException(status_code=400, detail="end_date phải sau start_date")
 
-    # Gọi YieldPlay tạo pool trước
-    start_ts = int(
-        datetime.combine(body.start_date, datetime.min.time())
-        .replace(tzinfo=timezone.utc)
-        .timestamp()
-    )
-    end_ts = int(
-        datetime.combine(body.end_date, datetime.min.time())
-        .replace(tzinfo=timezone.utc)
-        .timestamp()
-    )
+    game_id = settings.YIELDPLAY_GAME_ID
+    if not game_id:
+        raise HTTPException(status_code=500, detail="YIELDPLAY_GAME_ID chưa được cấu hình")
 
-    pool_response = await create_pool(
-        name=body.name,
-        start_time=start_ts,
-        end_time=end_ts,
+    round_response = await create_round(
+        game_id=game_id,
+        start_ts=_to_ts(body.start_date),
+        end_ts=_to_ts(body.end_date),
+        lock_time=body.lock_time,
+        deposit_fee_bps=0,
     )
 
-    if not pool_response.success:
-        raise HTTPException(status_code=502, detail="Failed to create YieldPlay pool")
-
-    # Lưu season vào DB với pool_id + round_id từ YieldPlay
     season = Season(
         name=body.name,
         start_date=body.start_date,
         end_date=body.end_date,
         status="active",
-        yieldplay_pool_id=pool_response.pool_id,
+        dev_fee_bps=body.dev_fee_bps,
+        yieldplay_game_id=game_id,
+        yieldplay_round_id=round_response.round_id,
     )
     db.add(season)
     await db.flush()
     await db.refresh(season)
     return SeasonOut.model_validate(season)
+
+
+# ── Get ────────────────────────────────────────────────────────────────────────
 
 
 @router.get("/active", response_model=SeasonOut)
@@ -70,6 +85,15 @@ async def get_active_season(db: AsyncSession = Depends(get_db)) -> SeasonOut:
     season = result.scalar_one_or_none()
     if season is None:
         raise HTTPException(status_code=404, detail="No active season found")
+    return SeasonOut.model_validate(season)
+
+
+@router.get("/{season_id}", response_model=SeasonOut)
+async def get_season(season_id: str, db: AsyncSession = Depends(get_db)) -> SeasonOut:
+    result = await db.execute(select(Season).where(Season.id == season_id))
+    season = result.scalar_one_or_none()
+    if season is None:
+        raise HTTPException(status_code=404, detail="Season not found")
     return SeasonOut.model_validate(season)
 
 
@@ -96,6 +120,9 @@ async def check_participation(
         )
     )
     return result.scalar_one_or_none() is not None
+
+
+# ── User Join → POST /users/deposit ───────────────────────────────────────────
 
 
 @router.post("/join", response_model=JoinSeasonResponse, status_code=201)
@@ -127,33 +154,26 @@ async def join_season_endpoint(
     if body.amount_staked < 1:
         raise HTTPException(status_code=400, detail="Minimum stake is 1 USDC")
 
-    # Gọi YieldPlay SDK (mock) – trả về YieldPlayJoinResponse (typed)
-    yp_response = await join_season(
-        user_id=str(body.user_id),
-        wallet_address=user.wallet_address,
-        amount_staked=body.amount_staked,
+    # Mock POST /users/deposit
+    # API thật: trả TransactionResult → frontend dùng MetaMask để sign & send
+    _ = await deposit(
+        user_wallet=user.wallet_address,
+        game_id=season.yieldplay_game_id or "",
+        round_id=season.yieldplay_round_id or 0,
+        amount_wei=_to_wei(body.amount_staked),
     )
-
-    split = calculate_stake_split(body.amount_staked)
 
     participant = SeasonParticipant(
         user_id=body.user_id,
         season_id=body.season_id,
         amount_staked=body.amount_staked,
-        participation_fee=split.participation_fee,
-        principal=split.principal,
     )
     db.add(participant)
 
-    season.base_reward_pool = float(season.base_reward_pool) + split.participation_fee
-    season.total_reward_pool = float(season.base_reward_pool) + float(season.yield_generated)
-
-    log = YieldPlayLog(
-        action="join-season",
-        payload={"user_id": str(body.user_id), "amount_staked": body.amount_staked},
-        response=yp_response.model_dump(),
-    )
-    db.add(log)
+    # Cập nhật total_deposited và ước tính prize pool
+    season.total_deposited = float(season.total_deposited) + body.amount_deposited
+    fee_preview = calculate_prize_pool(float(season.total_deposited), season.dev_fee_bps)
+    season.total_reward_pool = fee_preview.prize_pool_formatted
 
     await db.flush()
     await db.refresh(participant)
@@ -162,10 +182,11 @@ async def join_season_endpoint(
         participant_id=participant.id,
         user_id=participant.user_id,
         season_id=participant.season_id,
-        amount_staked=float(participant.amount_staked),
-        participation_fee=float(participant.participation_fee),
-        principal=float(participant.principal),
+        amount_deposited=float(participant.amount_staked),
     )
+
+
+# ── Admin: End Season ──────────────────────────────────────────────────────────
 
 
 @router.post("/{season_id}/end", response_model=EndSeasonResponse)
@@ -173,11 +194,37 @@ async def end_season(
     season_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> EndSeasonResponse:
-    """Admin: kết thúc season và gửi kết quả lên YieldPlay."""
+    """
+    Admin kết thúc season. Flow theo SDK:
+      1. POST /rounds/vault/deposit       → deploy funds sang Aave/Compound
+      2. POST /rounds/vault/withdraw      → rút principal + yield về contract
+      3. POST /rounds/settlement          → tính fee, cập nhật prize_pool
+      4. POST /rounds/winner × N          → phân phối theo score rank
+      5. POST /rounds/finalize            → mở claim window
+
+    Wordle mapping: score cao → prize lớn hơn (top3: 50/30/20%)
+    """
     season = await db.get(Season, season_id)
     if season is None:
         raise HTTPException(status_code=404, detail="Season not found")
+    if season.status == "ended":
+        raise HTTPException(status_code=400, detail="Season already ended")
 
+    game_id = season.yieldplay_game_id or season_id
+    round_id = season.yieldplay_round_id or 0
+
+    # ── Bước 1-3: Vault lifecycle + settlement ──
+    await deposit_to_vault(game_id, round_id)
+    await withdraw_from_vault(game_id, round_id)
+    await settlement(game_id, round_id)
+
+    # ── Bước 4: Tính prize pool thật từ yield ──
+    total_deposited = float(season.total_deposited or 0)
+    fee_breakdown = calculate_prize_pool(total_deposited, season.dev_fee_bps)
+    prize_pool = fee_breakdown.prize_pool_formatted
+    yield_generated = fee_breakdown.total_yield_formatted
+
+    # ── Bước 5: Lấy top 3 theo score, gọi choose_winner cho từng người ──
     rows = await db.execute(
         select(
             DailyAttempt.user_id,
@@ -186,28 +233,46 @@ async def end_season(
         .where(DailyAttempt.season_id == season_id)
         .group_by(DailyAttempt.user_id)
         .order_by(func.sum(DailyAttempt.score).desc())
+        .limit(3)
     )
 
-    season_results: list[SeasonResult] = [
-        SeasonResult(
-            user_id=str(row.user_id),
-            total_score=int(row.total_score or 0),
-            rank=i + 1,
+    winners: list[WinnerEntry] = []
+    for i, row in enumerate(rows.all()):
+        user = await db.get(User, row.user_id)
+        if not user:
+            continue
+
+        prize = round(prize_pool * TOP3_WEIGHTS[i], 6)
+        tx = await choose_winner(
+            game_id=game_id,
+            round_id=round_id,
+            winner_address=user.wallet_address,
+            amount_wei=_to_wei(prize),
         )
-        for i, row in enumerate(rows.all())
-    ]
+        winners.append(
+            WinnerEntry(
+                rank=i + 1,
+                user_id=str(row.user_id),
+                wallet_address=user.wallet_address,
+                prize_wei=_to_wei(prize),
+                prize_formatted=prize,
+                tx_hash=tx.tx_hash,
+            )
+        )
 
-    yp_response = await submit_results(season_id=str(season.id), results=season_results)
+    # ── Bước 6: Finalize → mở claim window ──
+    await finalize_round(game_id, round_id)
 
+    # ── Cập nhật season ──
     season.status = "ended"
-    season.yield_generated = yp_response.yield_generated
-    season.total_reward_pool = yp_response.total_reward_pool
+    season.yield_generated = yield_generated
+    season.prize_pool = prize_pool
 
-    log = YieldPlayLog(
-        action="submit-results",
-        payload={"season_id": season_id, "results_count": len(season_results)},
-        response=yp_response.model_dump(),
+    return EndSeasonResponse(
+        message=f"Season ended. {len(winners)} winners selected. Claim window is now open.",
+        game_id=game_id,
+        round_id=round_id,
+        winners=winners,
+        prize_pool_formatted=prize_pool,
+        yield_generated_formatted=yield_generated,
     )
-    db.add(log)
-
-    return EndSeasonResponse(message="Season ended", yieldplay_response=yp_response)

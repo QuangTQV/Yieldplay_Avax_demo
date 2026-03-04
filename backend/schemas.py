@@ -30,10 +30,14 @@ class UserOut(BaseModel):
 
 
 # ── Season ────────────────────────────────────────────────────────────────────
+
+
 class SeasonCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
     start_date: date
     end_date: date
+    lock_time: int = Field(..., gt=0)  # seconds before round end when deposits are locked
+    dev_fee_bps: int = Field(..., ge=0, le=10000)  # basis points, e.g. 1000 = 10%
 
 
 class SeasonOut(BaseModel):
@@ -42,11 +46,11 @@ class SeasonOut(BaseModel):
     start_date: date
     end_date: date
     status: SeasonStatus
-    base_reward_pool: float
-    yield_generated: float
-    total_reward_pool: float
-    yieldplay_pool_id: str | None = None
-    yieldplay_round_id: str | None = None
+    total_deposited: float = 0
+    yield_generated: float = 0
+    total_reward_pool: float = 0
+    yieldplay_game_id: str | None = None
+    yieldplay_round_id: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -66,7 +70,6 @@ class JoinSeasonResponse(BaseModel):
     season_id: UUID
     amount_staked: float
     participation_fee: float
-    principal: float
 
 
 # ── Game ──────────────────────────────────────────────────────────────────────

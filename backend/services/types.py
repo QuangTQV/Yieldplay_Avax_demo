@@ -1,123 +1,83 @@
 """
 Pydantic models cho service layer.
-Tách riêng khỏi schemas.py (API layer) để tránh circular import.
+Aligned với YieldPlay SDK (Solidity/EVM).
 """
-
 from __future__ import annotations
-
 from typing import Literal
-
 from pydantic import BaseModel, Field
 
-# ── Scoring / Word evaluation ──────────────────────────────────────────────────
+
+# ── Word evaluation ────────────────────────────────────────────────────────────
 
 LetterStatus = Literal["correct", "present", "absent"]
 
-
 class LetterEval(BaseModel):
-    """Kết quả đánh giá một ký tự trong lần đoán."""
-
     letter: str = Field(..., min_length=1, max_length=1)
     status: LetterStatus
 
 
-# ── YieldPlay SDK ──────────────────────────────────────────────────────────────
-
-
-class StakeSplit(BaseModel):
-    """Phân chia số tiền stake thành fee và principal."""
-
-    participation_fee: float
-    principal: float
-
+# ── Game types ─────────────────────────────────────────────────────────────────
 
 class SeasonResult(BaseModel):
-    """Một dòng kết quả gửi lên YieldPlay khi kết thúc season."""
-
+    """Score của một user cuối season — dùng để tính winner."""
     user_id: str
+    wallet_address: str
     total_score: int
     rank: int
 
 
-class YieldPlayDistribution(BaseModel):
-    """Phần thưởng phân phối cho một người chơi."""
+# ── YieldPlay SDK types ────────────────────────────────────────────────────────
 
+class TransactionResult(BaseModel):
+    """
+    Response từ mọi write endpoint của SDK.
+    tx_hash = None khi mock.
+    """
+    tx_hash: str | None = None
+    success: bool = True
+    message: str = ""
+
+
+class CreateGameResponse(BaseModel):
+    """Response từ POST /games."""
+    game_id: str        # bytes32 hex
+    transaction: TransactionResult
+
+
+class CreateRoundResponse(BaseModel):
+    """Response từ POST /games/{game_id}/rounds."""
+    round_id: int       # uint256
+    transaction: TransactionResult
+
+
+class FeeBreakdown(BaseModel):
+    """
+    Phân tích fee từ GET /rounds/{game_id}/{round_id}/fee-preview.
+    User KHÔNG mất principal — prize pool hoàn toàn từ yield.
+    """
+    total_yield_wei: int = 0
+    performance_fee_wei: int = 0      # 20% → protocol treasury
+    dev_fee_wei: int = 0              # X% → game treasury
+    prize_pool_wei: int = 0           # phần còn lại → winners
+    total_yield_formatted: float = 0.0
+    prize_pool_formatted: float = 0.0
+
+
+class WinnerEntry(BaseModel):
+    """Một winner được game owner chọn."""
     rank: int
     user_id: str
-    reward_usdc: float
-
-
-class YieldPlayJoinResponse(BaseModel):
-    """Response từ POST /yieldplay/join-season (mock)."""
-
-    success: bool
-    yieldplay_participant_id: str
-    user_id: str
     wallet_address: str
-    amount_staked: float
-    participation_fee: float
-    principal: float
-    staked_at: str
-    estimated_yield_apy: str
-    message: str
-
-
-class YieldPlaySubmitResponse(BaseModel):
-    """Response từ POST /yieldplay/submit-results (mock)."""
-
-    success: bool
-    season_id: str
-    yieldplay_job_id: str
-    total_reward_pool: float
-    base_pool_from_fees: float
-    yield_generated: float
-    distributions: list[YieldPlayDistribution]
-    status: str
-    message: str
-
-
-class YieldPlayPoolStatus(BaseModel):
-    """Trạng thái pool hiện tại của một season."""
-
-    season_id: str
-    base_pool: float
-    yield_accrued: float
-    total_pool: float
-    participants: int
-    apy: str
+    prize_wei: int
+    prize_formatted: float
+    tx_hash: str | None = None
 
 
 class EndSeasonResponse(BaseModel):
-    """Response trả về từ endpoint kết thúc season."""
-
+    """Response từ POST /seasons/{id}/end."""
     message: str
-    yieldplay_response: YieldPlaySubmitResponse
-
-
-from datetime import datetime
-
-from pydantic import BaseModel, Field
-
-
-class YieldPlayCreatePoolResponse(BaseModel):
-    success: bool = Field(..., description="Indicates whether pool creation succeeded")
-    pool_id: str = Field(..., description="Unique identifier of the created pool")
-    name: str = Field(..., description="Name of the pool")
-    start_time: datetime = Field(..., description="Pool start timestamp (UTC)")
-    end_time: datetime = Field(..., description="Pool end timestamp (UTC)")
-    status: str = Field(..., description="Current status of the pool (e.g., active)")
-    message: str = Field(..., description="Human-readable status message")
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "success": True,
-                "pool_id": "550e8400-e29b-41d4-a716-446655440000",
-                "name": "Wordle Season 1",
-                "start_time": "2026-03-01T00:00:00Z",
-                "end_time": "2026-03-30T23:59:59Z",
-                "status": "active",
-                "message": "pool created. pool_id=550e8400-e29b-41d4-a716-446655440000",
-            }
-        }
-    }
+    game_id: str
+    round_id: int
+    winners: list[WinnerEntry]
+    prize_pool_formatted: float
+    yield_generated_formatted: float

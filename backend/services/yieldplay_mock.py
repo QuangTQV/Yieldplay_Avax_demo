@@ -1,161 +1,344 @@
 """
-Mock YieldPlay SDK – simulates the real API calls.
-Replace HTTP calls with real endpoint when SDK is live.
+YieldPlay Real Client — gọi trực tiếp YieldPlay API server.
+
+Interface GIỐNG HỆT yieldplay_mock.py — seasons.py không cần thay đổi.
+
+Khi switch từ mock sang real:
+    .env: YIELDPLAY_USE_MOCK=false
+    Đảm bảo YIELDPLAY_BASE_URL, YIELDPLAY_API_KEY, YIELDPLAY_GAME_ID đã set.
+
+Endpoints ánh xạ:
+    create_game()          → POST /games
+    create_round()         → POST /games/{game_id}/rounds
+    approve_token()        → POST /users/approve
+    deposit()              → POST /users/deposit
+    claim()                → POST /users/claim
+    deposit_to_vault()     → POST /rounds/vault/deposit
+    withdraw_from_vault()  → POST /rounds/vault/withdraw
+    settlement()           → POST /rounds/settlement
+    choose_winner()        → POST /rounds/winner
+    finalize_round()       → POST /rounds/finalize
+    get_fee_preview()      → GET  /rounds/{game_id}/{round_id}/fee-preview
+    calculate_prize_pool() → local arithmetic (giống mock)
 """
 
-import random
-import uuid
-from datetime import datetime, timezone
+from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from decimal import Decimal
+
+import httpx
 
 from config import settings
 from services.types import (
-    SeasonResult,
-    StakeSplit,
-    YieldPlayCreatePoolResponse,
-    YieldPlayDistribution,
-    YieldPlayJoinResponse,
-    YieldPlayPoolStatus,
-    YieldPlaySubmitResponse,
+    CreateGameResponse,
+    CreateRoundResponse,
+    FeeBreakdown,
+    TransactionResult,
 )
 
-PARTICIPATION_FEE_RATIO: float = settings.PARTICIPATION_FEE_RATIO  # 2%
-TOP3_WEIGHTS: list[float] = [0.50, 0.30, 0.20]
-MOCK_APY: float = 0.045  # 4.5% APY
+PERFORMANCE_FEE_BPS: int = 2000
+MOCK_APY: float = 0.045
 SEASON_DAYS: int = 30
-MOCK_STAKE_PER_USER: float = 10.0  # giả định mỗi user stake 10 USDC
+DECIMALS: int = 6
+TOP3_WEIGHTS: list[float] = [0.50, 0.30, 0.20]
 
 
-class SerializedTxData(BaseModel):
-    """Data containing the base64 transaction string."""
-
-    transaction: str = Field(description="Base64 encoded transaction string")
+# ── HTTP client ────────────────────────────────────────────────────────────────
 
 
-class SerializedTxResponse(BaseModel):
-    """Response wrapper for transaction building endpoints."""
-
-    success: bool = Field(default=True)
-    data: SerializedTxData
-    trace_id: str = Field(default="tx-builder")
-
-
-# ── 1. Tạo Pool ────────────────────────────────────────────────────────────────
+def _headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.YIELDPLAY_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
-async def create_pool(
-    name: str,
-    start_time: int,  # unix timestamp
-    end_time: int,  # unix timestamp
-) -> YieldPlayCreatePoolResponse:
-    """
-    Mock POST /pools
-
-    API thật:
-        payload = CreateRoundRequest(
-            ticket_base_price=int(ticket_base_price * 1_000_000),  # lamport
-            ticket_price_jump=int(ticket_price_jump * 1_000_000),
-            start_time=start_time,
-            end_time=end_time,
+async def _post(path: str, body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{settings.YIELDPLAY_BASE_URL}{path}",
+            json=body,
+            headers=_headers(),
         )
-        response = await contract_connector_client.create_round(payload)
-        pool.round_id = response.data.round_id  # ID on-chain
-
-    Mock: trả về pool_id và round_id giả.
-    """
-    mock_pool_id = str(uuid.uuid4())
-
-    return YieldPlayCreatePoolResponse(
-        success=True,
-        pool_id=mock_pool_id,
-        name=name,
-        start_time=start_time,
-        end_time=end_time,
-        status="active",
-        message=f"pool created. pool_id={mock_pool_id}",
-    )
+        r.raise_for_status()
+        return r.json()
 
 
-# ----------------------------------------------------
-
-
-def calculate_stake_split(amount_staked: float) -> StakeSplit:
-    """Phân chia số tiền stake thành participation_fee và principal."""
-    fee = round(amount_staked * PARTICIPATION_FEE_RATIO, 6)
-    principal = round(amount_staked - fee, 6)
-    return StakeSplit(participation_fee=fee, principal=principal)
-
-
-async def join_season(
-    user_id: str,
-    wallet_address: str,
-    amount_staked: float,
-) -> YieldPlayJoinResponse:
-    """
-    Mock POST /yieldplay/join-season
-    Trả về YieldPlayJoinResponse với participant ID giả.
-    """
-    split = calculate_stake_split(amount_staked)
-    return YieldPlayJoinResponse(
-        success=True,
-        yieldplay_participant_id=str(uuid.uuid4()),
-        user_id=user_id,
-        wallet_address=wallet_address,
-        amount_staked=amount_staked,
-        participation_fee=split.participation_fee,
-        principal=split.principal,
-        staked_at=datetime.now(tz=timezone.utc).isoformat(),
-        estimated_yield_apy="4.5%",
-        message="Successfully joined season. Principal is now generating yield.",
-    )
-
-
-async def submit_results(
-    season_id: str,
-    results: list[SeasonResult],
-) -> YieldPlaySubmitResponse:
-    """
-    Mock POST /yieldplay/submit-results
-    Nhận danh sách SeasonResult, trả về phân phối thưởng.
-    """
-    total_participants = len(results)
-    base_pool = round(total_participants * MOCK_STAKE_PER_USER * PARTICIPATION_FEE_RATIO, 4)
-    yield_generated = round(base_pool * MOCK_APY * (SEASON_DAYS / 365), 4)
-    total_pool = round(base_pool + yield_generated, 4)
-
-    sorted_results = sorted(results, key=lambda r: r.total_score, reverse=True)
-    distributions: list[YieldPlayDistribution] = [
-        YieldPlayDistribution(
-            rank=i + 1,
-            user_id=entry.user_id,
-            reward_usdc=round(total_pool * TOP3_WEIGHTS[i], 4),
+async def _get(path: str, params: dict | None = None) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{settings.YIELDPLAY_BASE_URL}{path}",
+            params=params,
+            headers=_headers(),
         )
-        for i, entry in enumerate(sorted_results[: len(TOP3_WEIGHTS)])
-    ]
+        r.raise_for_status()
+        return r.json()
 
-    return YieldPlaySubmitResponse(
-        success=True,
-        season_id=season_id,
-        yieldplay_job_id=str(uuid.uuid4()),
-        total_reward_pool=total_pool,
-        base_pool_from_fees=base_pool,
-        yield_generated=yield_generated,
-        distributions=distributions,
-        status="processing",
-        message="Rewards are being distributed on-chain.",
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _to_wei(amount: float) -> int:
+    return int(Decimal(str(amount)) * Decimal(10**DECIMALS))
+
+
+def _from_wei(amount_wei: int) -> float:
+    return float(Decimal(str(amount_wei)) / Decimal(10**DECIMALS))
+
+
+def _tx(data: dict) -> TransactionResult:
+    return TransactionResult(
+        tx_hash=data.get("tx_hash") or data.get("transaction", {}).get("tx_hash"),
+        success=data.get("success", True),
+        message=data.get("message", ""),
     )
 
 
-async def get_pool_status(season_id: str) -> YieldPlayPoolStatus:
-    """Mock: trả về trạng thái pool hiện tại của một season."""
-    base = round(random.uniform(50, 200), 4)
-    yield_acc = round(random.uniform(1, 10), 4)
-    return YieldPlayPoolStatus(
-        season_id=season_id,
-        base_pool=base,
-        yield_accrued=yield_acc,
-        total_pool=round(base + yield_acc, 4),
-        participants=random.randint(10, 100),
-        apy="4.5%",
+# ── Fee calculation (local, không cần API call) ────────────────────────────────
+
+
+def calculate_prize_pool(
+    total_deposited: float,
+    dev_fee_bps: int = 1000,
+    deposit_fee_bps: int = 0,
+) -> FeeBreakdown:
+    """
+    Arithmetic thuần — không cần gọi API.
+    Giống mock, dùng để estimate prize pool realtime.
+
+    prize_pool = yield_to_pool + deposit_fee
+    """
+    yield_amount = total_deposited * MOCK_APY * (SEASON_DAYS / 365)
+    perf_fee = yield_amount * (PERFORMANCE_FEE_BPS / 10000)
+    net_yield = yield_amount - perf_fee
+    dev_fee = net_yield * (dev_fee_bps / 10000)
+    yield_to_pool = net_yield - dev_fee
+    deposit_fee = total_deposited * (deposit_fee_bps / 10000)
+    prize_pool = yield_to_pool + deposit_fee
+
+    return FeeBreakdown(
+        total_yield_wei=_to_wei(yield_amount),
+        performance_fee_wei=_to_wei(perf_fee),
+        dev_fee_wei=_to_wei(dev_fee),
+        deposit_fee_wei=_to_wei(deposit_fee),
+        prize_pool_wei=_to_wei(prize_pool),
+        total_yield_formatted=round(yield_amount, 6),
+        deposit_fee_formatted=round(deposit_fee, 6),
+        prize_pool_formatted=round(prize_pool, 6),
     )
+
+
+# ── 1. POST /games ─────────────────────────────────────────────────────────────
+
+
+async def create_game(
+    game_name: str,
+    dev_fee_bps: int = 1000,
+    treasury: str = "0x0000000000000000000000000000000000000000",
+) -> CreateGameResponse:
+    data = await _post(
+        "/games",
+        {
+            "game_name": game_name,
+            "dev_fee_bps": dev_fee_bps,
+            "treasury": treasury,
+        },
+    )
+    return CreateGameResponse(
+        game_id=data["game_id"],
+        transaction=_tx(data.get("transaction", {})),
+    )
+
+
+# ── 2. POST /games/{game_id}/rounds ───────────────────────────────────────────
+
+
+async def create_round(
+    game_id: str,
+    start_ts: int,
+    end_ts: int,
+    lock_time: int = 43200,
+    deposit_fee_bps: int = 0,
+) -> CreateRoundResponse:
+    data = await _post(
+        f"/games/{game_id}/rounds",
+        {
+            "game_id": game_id,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "lock_time": lock_time,
+            "deposit_fee_bps": deposit_fee_bps,
+        },
+    )
+    return CreateRoundResponse(
+        round_id=data["round_id"],
+        transaction=_tx(data.get("transaction", {})),
+    )
+
+
+# ── 3. POST /users/approve ────────────────────────────────────────────────────
+
+
+async def approve_token(
+    user_wallet: str,
+    token_address: str,
+    amount_wei: int | None = None,
+) -> TransactionResult:
+    body: dict = {"token_address": token_address}
+    if amount_wei is not None:
+        body["amount_wei"] = str(amount_wei)
+    return _tx(await _post("/users/approve", body))
+
+
+# ── 4. POST /users/deposit ────────────────────────────────────────────────────
+
+
+async def deposit(
+    user_wallet: str,
+    game_id: str,
+    round_id: int,
+    amount_wei: int,
+) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/users/deposit",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+                "amount_wei": str(amount_wei),
+            },
+        )
+    )
+
+
+# ── 5. POST /users/claim ──────────────────────────────────────────────────────
+
+
+async def claim(
+    user_wallet: str,
+    game_id: str,
+    round_id: int,
+) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/users/claim",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+            },
+        )
+    )
+
+
+# ── 6. POST /rounds/vault/deposit ─────────────────────────────────────────────
+
+
+async def deposit_to_vault(game_id: str, round_id: int) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/rounds/vault/deposit",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+            },
+        )
+    )
+
+
+# ── 7. POST /rounds/vault/withdraw ────────────────────────────────────────────
+
+
+async def withdraw_from_vault(game_id: str, round_id: int) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/rounds/vault/withdraw",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+            },
+        )
+    )
+
+
+# ── 8. POST /rounds/settlement ────────────────────────────────────────────────
+
+
+async def settlement(game_id: str, round_id: int) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/rounds/settlement",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+            },
+        )
+    )
+
+
+# ── 9. POST /rounds/winner ────────────────────────────────────────────────────
+
+
+async def choose_winner(
+    game_id: str,
+    round_id: int,
+    winner_address: str,
+    amount_wei: int,
+) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/rounds/winner",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+                "winner": winner_address,
+                "amount_wei": str(amount_wei),
+            },
+        )
+    )
+
+
+# ── 10. POST /rounds/finalize ─────────────────────────────────────────────────
+
+
+async def finalize_round(game_id: str, round_id: int) -> TransactionResult:
+    return _tx(
+        await _post(
+            "/rounds/finalize",
+            {
+                "game_id": game_id,
+                "round_id": round_id,
+            },
+        )
+    )
+
+
+# ── 11. GET /rounds/{game_id}/{round_id}/fee-preview ──────────────────────────
+
+
+async def get_fee_preview(
+    game_id: str,
+    round_id: int,
+    total_deposited: float,
+    dev_fee_bps: int = 1000,
+) -> FeeBreakdown:
+    """
+    Gọi API để lấy fee preview chính xác từ on-chain state.
+    Fallback về local calculation nếu API fail.
+    """
+    try:
+        data = await _get(
+            f"/rounds/{game_id}/{round_id}/fee-preview",
+            params={"yield_wei": _to_wei(total_deposited * MOCK_APY * SEASON_DAYS / 365)},
+        )
+        return FeeBreakdown(
+            total_yield_wei=int(data.get("total_yield_wei", 0)),
+            performance_fee_wei=int(data.get("performance_fee_wei", 0)),
+            dev_fee_wei=int(data.get("dev_fee_wei", 0)),
+            deposit_fee_wei=int(data.get("deposit_fee_wei", 0)),
+            prize_pool_wei=int(data.get("prize_pool_wei", 0)),
+            total_yield_formatted=float(data.get("total_yield_formatted", 0)),
+            deposit_fee_formatted=float(data.get("deposit_fee_formatted", 0)),
+            prize_pool_formatted=float(data.get("prize_pool_formatted", 0)),
+        )
+    except Exception:
+        return calculate_prize_pool(total_deposited, dev_fee_bps)
